@@ -39,11 +39,33 @@ MAX_OR_SIZE_PTS  = 30.0           # skip if OR too wide (choppy open)
 MIN_OR_SIZE_PTS  = 3.0            # skip if OR too tight (low conviction)
 BREAKOUT_CONFIRM = 0.5            # price must break by 0.5pts beyond OR edge
 
-# MFFU Builder account rules
-MAX_DAY_LOSS    = -1_000.0
-EOD_TRAIL_MAX   =  2_000.0
-PAYOUT_BUFFER   =  2_100.0
-PAYOUT_THRESHOLD =   500.0
+# MFFU $25K Account — MFFUEVRPD505461066
+# Eval:       Profit target $1,500 | Max EOD loss $1,000 | 50% consistency | 2 min days
+# Sim-Funded: Intraday trailing $1,000 | MLL locks at +$100 | Max 3 mini / 30 micro
+# Payout:     Daily | 90/10 split | $500 min | $1,100 buffer | No Tier 1 news
+
+IS_EVAL_MODE     = True        # True = eval, False = sim-funded
+PROFIT_TARGET    = 1_500.0     # eval profit target
+MAX_EOD_LOSS     = -1_000.0    # EOD trailing drawdown limit
+INTRADAY_TRAIL   = -1_000.0    # sim-funded intraday trailing
+MLL_LOCK_AT      =    100.0    # trailing stops once +$100 profit reached (sim-funded)
+PAYOUT_BUFFER    =  1_100.0    # sim-funded payout buffer
+PAYOUT_THRESHOLD =    500.0    # min payout amount
+CONSISTENCY_CAP  =    0.50     # eval only — no single day > 50% of total profits
+
+# No daily loss limit on this account — EOD trailing is the protection
+MAX_DAY_LOSS     = -99_999.0   # effectively disabled
+
+# Tier 1 news times (ET) — no trades 30 mins before/after
+# Add dates as needed when news calendar is known
+TIER1_NEWS_TIMES: list[tuple[int,int]] = [
+    # (hour, minute) ET — common recurring Tier 1 times
+    (8, 30),   # CPI, NFP, Retail Sales, etc.
+    (10, 0),   # ISM, Consumer Confidence
+    (14, 0),   # FOMC decision (some days)
+    (14, 30),  # FOMC press conference start
+]
+NEWS_BLOCK_MINS = 30  # block trades within this many mins of Tier 1
 
 # Trade sizing — ES micro contracts
 # ES point value = $50/pt, MES = $5/pt
@@ -54,10 +76,10 @@ POINT_VALUE  = 5.0  # MES
 # ── ENV ───────────────────────────────────────────────────────────────────────
 PMT_URL        = os.getenv("PMT_WEBHOOK_URL",     "https://api.pickmytrade.trade/v2/add-trade-data-latest?t=18504")
 PMT_TOKEN      = os.getenv("PMT_TOKEN",           "")
-PMT_ACCOUNT    = os.getenv("PMT_ACCOUNT_ID",      "53430171")
+PMT_ACCOUNT    = os.getenv("PMT_ACCOUNT_ID",      "54155940")
 TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN",  "")
 TG_CHAT        = os.getenv("TELEGRAM_CHAT_ID",    "")
-TRADOVATE_ACCT = os.getenv("TRADOVATE_ACCOUNT_ID","MFFUEVBLDR505461067")
+TRADOVATE_ACCT = os.getenv("TRADOVATE_ACCOUNT_ID","MFFUEVRPD505461066")
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
 price_es    = 0.0       # latest ES/MES tick
@@ -200,6 +222,7 @@ class DayStats:
         self.losses          = 0
         self.yesterday_pnl   = 0.0
         self.payout_count    = 0
+        self.intraday_peak   = 0.0
 
     def _reset_day(self):
         today = date.today()
@@ -207,8 +230,9 @@ class DayStats:
             self.yesterday_pnl = self.day_pnl
             if self.total_pnl > self.eod_peak_pnl:
                 self.eod_peak_pnl = self.total_pnl
-            self.day_pnl  = 0.0
-            self.day_date = today
+            self.day_pnl        = 0.0
+            self.intraday_peak  = 0.0
+            self.day_date       = today
 
     @property
     def trailing_floor(self): return self.eod_peak_pnl - EOD_TRAIL_MAX
@@ -227,14 +251,39 @@ class DayStats:
         self.day_pnl   += pnl
         if pnl > 0: self.wins   += 1
         else:       self.losses += 1
+        if self.total_pnl > self.intraday_peak:
+            self.intraday_peak = self.total_pnl
         return self.total_pnl <= self.trailing_floor
 
-    def can_trade(self) -> tuple[bool, str]:
+    @property
+    def trailing_floor_intraday(self) -> float:
+        """Sim-funded uses intraday trailing from peak intraday P&L."""
+        return self.intraday_peak + INTRADAY_TRAIL
+
+    def can_trade(self, now: datetime = None) -> tuple[bool, str]:
         self._reset_day()
-        if self.total_pnl <= self.trailing_floor:
+        # EOD trailing drawdown (eval mode)
+        if IS_EVAL_MODE and self.total_pnl <= self.trailing_floor:
             return False, f"EOD trailing drawdown hit (floor: ${self.trailing_floor:.0f})"
-        if self.day_pnl   <= MAX_DAY_LOSS:
-            return False, f"Daily loss limit hit (${self.day_pnl:.0f})"
+        # Intraday trailing (sim-funded)
+        if not IS_EVAL_MODE and self.total_pnl <= self.trailing_floor_intraday:
+            return False, f"Intraday trailing hit (floor: ${self.trailing_floor_intraday:.0f})"
+        # Eval profit target
+        if IS_EVAL_MODE and self.total_pnl >= PROFIT_TARGET:
+            return False, f"Profit target reached! (${self.total_pnl:.0f})"
+        # Consistency rule (eval only) — no single day > 50% of total profits
+        if IS_EVAL_MODE and self.total_pnl > 0:
+            max_day = self.total_pnl * CONSISTENCY_CAP
+            if self.day_pnl >= max_day:
+                return False, f"Consistency cap hit (day ${self.day_pnl:.0f} > 50% of ${self.total_pnl:.0f})"
+        # News filter
+        if now:
+            h, m = now.hour, now.minute
+            for nh, nm in TIER1_NEWS_TIMES:
+                news_mins = nh * 60 + nm
+                curr_mins = h * 60 + m
+                if abs(curr_mins - news_mins) <= NEWS_BLOCK_MINS:
+                    return False, f"Tier 1 news window ({nh:02d}:{nm:02d} ET ±{NEWS_BLOCK_MINS}min)"
         return True, "ok"
 
     def status(self) -> dict:
@@ -252,6 +301,8 @@ class DayStats:
             "payout_count":       self.payout_count,
             "to_payout":          round(max(0, PAYOUT_BUFFER + PAYOUT_THRESHOLD - self.total_pnl), 2),
             "yesterday_pnl":      round(self.yesterday_pnl, 2),
+            "to_target":          round(max(0, PROFIT_TARGET - self.total_pnl), 2),
+            "is_eval":            IS_EVAL_MODE,
         }
 
 stats = DayStats()
@@ -359,7 +410,7 @@ async def process_price(price: float, now: datetime):
         return
 
     # Check kill conditions
-    allowed, reason = stats.can_trade()
+    allowed, reason = stats.can_trade(datetime.now(EST))
     if not allowed:
         return
 
@@ -423,7 +474,7 @@ async def process_price(price: float, now: datetime):
 async def report_premarket():
     """7:55 AM ET — ORB setup brief before market opens."""
     s = stats.status()
-    allowed, reason = stats.can_trade()
+    allowed, reason = stats.can_trade(datetime.now(EST))
     await send_telegram(
         f"⚡ *ORB Pre-Market Brief* — opens in 5 mins\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -495,7 +546,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    allowed, reason = stats.can_trade()
+    allowed, reason = stats.can_trade(datetime.now(EST))
     now = datetime.now(EST)
     h, m = now.hour, now.minute
     if 8*60 <= h*60+m <= 8*60+15:   phase = "BUILDING_OR"
@@ -556,7 +607,7 @@ async def record_result(p: ResultPayload):
 
 @app.get("/stats")
 async def get_stats():
-    allowed, reason = stats.can_trade()
+    allowed, reason = stats.can_trade(datetime.now(EST))
     return {**stats.status(), "trading_allowed": allowed, "reason": reason,
             "orb": orb.status()}
 
