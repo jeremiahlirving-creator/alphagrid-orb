@@ -628,6 +628,20 @@ async def report_eod_now():
     await report_eod()
     return {"ok": True}
 
+@app.post("/test-trade")
+async def test_trade():
+    """Fire a test ORB trade to verify PMT → Tradovate pipeline."""
+    test_price = price_es if price_es > 0 else 7555.0
+    # Simulate a 10pt OR for test
+    test_or_size = 10.0
+    test_tp = test_or_size * OR_TP_MULTIPLIER * CONTRACTS * POINT_VALUE   # $150
+    test_sl = test_or_size * CONTRACTS * POINT_VALUE                       # $100
+    ok, body = await fire_pmt("buy", test_tp, test_sl)
+    status = "✅" if ok else "❌"
+    msg = f"🧪 *ORB Test Trade*\nMES BUY @ `{test_price:.2f}`\n{status} PMT: `{body[:100]}`\nTP: `+${test_tp:.0f}` | SL: `-${test_sl:.0f}`"
+    await send_telegram(msg)
+    return {"ok": ok, "body": body[:200], "price": test_price}
+
 @app.websocket("/ws")
 async def ws_ep(ws: WebSocket):
     await ws.accept()
