@@ -166,26 +166,29 @@ class ORBState:
                     f"Triggers: >{self.breakout_high:.2f} / <{self.breakout_low:.2f}"
                 )
 
-    def check_breakout(self, price: float) -> Optional[str]:
-        """Returns 'BUY', 'SELL', or None."""
+    def check_breakout(self, price: float, tuner_bias: str = None) -> Optional[str]:
+        """Returns 'BUY', 'SELL', or None. tuner_bias overrides OR bias if set."""
         if not self.or_locked or self.or_skip or self.gap_skip or self.traded_today:
             return None
-        # Only trade in bias direction
-        if price >= self.breakout_high and (self.bias == "BUY" or self.bias is None):
+        # Use tuner bias if set, else OR bias
+        active_bias = tuner_bias if tuner_bias and tuner_bias != "BOTH" else self.bias
+        if price >= self.breakout_high and (active_bias == "BUY" or active_bias is None):
             return "BUY"
-        if price <= self.breakout_low  and (self.bias == "SELL" or self.bias is None):
+        if price <= self.breakout_low  and (active_bias == "SELL" or active_bias is None):
             return "SELL"
         return None
 
-    def tp_price(self, direction: str, entry: float) -> float:
-        tp_pts = self.or_size * OR_TP_MULTIPLIER
+    def tp_price(self, direction: str, entry: float, tp_mult: float = None) -> float:
+        mult   = tp_mult if tp_mult else OR_TP_MULTIPLIER
+        tp_pts = self.or_size * mult
         return entry + tp_pts if direction == "BUY" else entry - tp_pts
 
     def sl_price(self, direction: str) -> float:
         return self.or_low if direction == "BUY" else self.or_high
 
-    def dollar_tp(self, direction: str, entry: float) -> float:
-        tp_pts = self.or_size * OR_TP_MULTIPLIER
+    def dollar_tp(self, direction: str, entry: float, tp_mult: float = None) -> float:
+        mult   = tp_mult if tp_mult else OR_TP_MULTIPLIER
+        tp_pts = self.or_size * mult
         return tp_pts * CONTRACTS * POINT_VALUE
 
     def dollar_sl(self) -> float:
@@ -210,6 +213,174 @@ class ORBState:
         }
 
 orb = ORBState()
+
+# ── ORB SELF-TUNING ENGINE ───────────────────────────────────────────────────
+# Tunes after every 10 trades. Adjusts:
+# - TP multiplier (1.2× – 2.5×)
+# - OR size filter (min/max pts)
+# - Breakout confirmation buffer
+# - Direction bias (BUY only / SELL only / both)
+# - Trade window end time
+
+ORB_TUNE_EVERY = 10
+
+class ORBTradeRecord:
+    def __init__(self, direction, or_size, entry_time_mins, pnl, won, bias):
+        self.direction       = direction        # BUY or SELL
+        self.or_size         = or_size          # OR size in pts
+        self.entry_time_mins = entry_time_mins  # mins since midnight ET
+        self.pnl             = pnl
+        self.won             = won
+        self.bias            = bias             # BUY/SELL/None
+        self.ts              = datetime.now(EST).strftime("%Y-%m-%d %H:%M ET")
+
+class ORBTuner:
+    def __init__(self):
+        self.records: list[ORBTradeRecord] = []
+        self.trades_since_tune = 0
+        self.tune_count        = 0
+
+        # Tunable parameters — start at defaults
+        self.tp_multiplier     = OR_TP_MULTIPLIER   # 1.5×
+        self.min_or_size       = MIN_OR_SIZE_PTS     # 3.0pts
+        self.max_or_size       = MAX_OR_SIZE_PTS     # 30.0pts
+        self.breakout_confirm  = BREAKOUT_CONFIRM    # 0.5pts
+        self.direction_bias    = None                # None = both, "BUY", "SELL"
+        self.trade_window_end  = (9, 30)             # (hour, minute) ET
+
+    def record(self, rec: ORBTradeRecord):
+        self.records.append(rec)
+        self.trades_since_tune += 1
+
+    def _wr(self, subset):
+        if not subset: return None
+        return sum(1 for r in subset if r.won) / len(subset)
+
+    def tune(self) -> list[str]:
+        self.tune_count       += 1
+        self.trades_since_tune = 0
+        changes = []
+        recent = self.records[-30:]   # last 30 trades max
+
+        if len(recent) < 5:
+            return changes
+
+        wr = self._wr(recent)
+
+        # ── 1. TP MULTIPLIER ──────────────────────────────────────────────────
+        old_tp = self.tp_multiplier
+        if wr >= 0.65:
+            # Winning well — let runners run
+            new_tp = min(old_tp + 0.25, 2.5)
+            reason = f"WR {wr:.0%} ≥ 65% — extending runners"
+        elif wr >= 0.50:
+            # Decent — hold steady or slight increase
+            new_tp = min(old_tp + 0.10, 2.5)
+            reason = f"WR {wr:.0%} ≥ 50% — slight extend"
+        elif wr < 0.35:
+            # Losing — take profits faster
+            new_tp = max(old_tp - 0.20, 1.2)
+            reason = f"WR {wr:.0%} < 35% — tighten TP"
+        else:
+            new_tp = old_tp
+            reason = None
+        if reason and abs(new_tp - old_tp) > 0.05:
+            self.tp_multiplier = round(new_tp, 2)
+            changes.append(f"📐 TP mult {old_tp:.1f}×→{new_tp:.1f}× ({reason})")
+
+        # ── 2. OR SIZE FILTER ─────────────────────────────────────────────────
+        small_or = [r for r in recent if r.or_size < 8]
+        large_or = [r for r in recent if r.or_size >= 15]
+        if len(small_or) >= 4:
+            small_wr = self._wr(small_or)
+            if small_wr is not None and small_wr < 0.35:
+                old_min = self.min_or_size
+                self.min_or_size = min(old_min + 1.0, 10.0)
+                changes.append(f"📏 Min OR {old_min:.0f}→{self.min_or_size:.0f}pts (small OR WR {small_wr:.0%})")
+            elif small_wr is not None and small_wr >= 0.60:
+                old_min = self.min_or_size
+                self.min_or_size = max(old_min - 0.5, 2.0)
+                changes.append(f"📏 Min OR {old_min:.0f}→{self.min_or_size:.0f}pts (small OR WR {small_wr:.0%})")
+        if len(large_or) >= 4:
+            large_wr = self._wr(large_or)
+            if large_wr is not None and large_wr < 0.35:
+                old_max = self.max_or_size
+                self.max_or_size = max(old_max - 3.0, 15.0)
+                changes.append(f"📏 Max OR {old_max:.0f}→{self.max_or_size:.0f}pts (large OR WR {large_wr:.0%})")
+
+        # ── 3. DIRECTION BIAS ─────────────────────────────────────────────────
+        buys  = [r for r in recent if r.direction == "BUY"]
+        sells = [r for r in recent if r.direction == "SELL"]
+        buy_wr  = self._wr(buys)
+        sell_wr = self._wr(sells)
+        old_bias = self.direction_bias
+        if buy_wr is not None and sell_wr is not None and len(buys) >= 4 and len(sells) >= 4:
+            if buy_wr >= 0.60 and sell_wr < 0.35:
+                self.direction_bias = "BUY"
+            elif sell_wr >= 0.60 and buy_wr < 0.35:
+                self.direction_bias = "SELL"
+            elif buy_wr >= 0.45 and sell_wr >= 0.45:
+                self.direction_bias = None
+        if self.direction_bias != old_bias:
+            bias_str = self.direction_bias or "BOTH"
+            old_str  = old_bias or "BOTH"
+            b_wr = f"{buy_wr:.0%}" if buy_wr else "—"
+            s_wr = f"{sell_wr:.0%}" if sell_wr else "—"
+            changes.append(f"🧭 Bias {old_str}→{bias_str} (BUY {b_wr} / SELL {s_wr})")
+
+        # ── 4. TRADE WINDOW ───────────────────────────────────────────────────
+        early  = [r for r in recent if r.entry_time_mins < 8*60+30]   # before 8:30
+        late   = [r for r in recent if r.entry_time_mins >= 9*60]     # after 9:00
+        if len(late) >= 4:
+            late_wr = self._wr(late)
+            if late_wr is not None and late_wr < 0.35:
+                old_end = self.trade_window_end
+                self.trade_window_end = (9, 0)
+                changes.append(f"⏱️ Window end {old_end[0]}:{old_end[1]:02d}→9:00 ET (late WR {late_wr:.0%})")
+        if len(early) >= 8:
+            early_wr = self._wr(early)
+            if early_wr is not None and early_wr >= 0.60 and self.trade_window_end == (9, 0):
+                self.trade_window_end = (9, 30)
+                changes.append(f"⏱️ Window restored to 9:30 ET (early WR {early_wr:.0%} strong)")
+
+        # ── 5. BREAKOUT CONFIRM ───────────────────────────────────────────────
+        if wr < 0.35:
+            old_buf = self.breakout_confirm
+            self.breakout_confirm = min(old_buf + 0.25, 2.0)
+            if abs(self.breakout_confirm - old_buf) > 0.1:
+                changes.append(f"🎯 Breakout confirm {old_buf:.2f}→{self.breakout_confirm:.2f}pts (WR {wr:.0%})")
+        elif wr >= 0.65:
+            old_buf = self.breakout_confirm
+            self.breakout_confirm = max(old_buf - 0.10, 0.25)
+            if abs(self.breakout_confirm - old_buf) > 0.05:
+                changes.append(f"🎯 Breakout confirm {old_buf:.2f}→{self.breakout_confirm:.2f}pts (WR {wr:.0%})")
+
+        return changes
+
+    def in_trade_window(self, now: datetime) -> bool:
+        h, m = now.hour, now.minute
+        mins = h * 60 + m
+        end_mins = self.trade_window_end[0] * 60 + self.trade_window_end[1]
+        return 8*60+15 <= mins <= end_mins
+
+    def status(self) -> dict:
+        recent = self.records[-30:]
+        wins   = sum(1 for r in recent if r.won)
+        return {
+            "tune_count":        self.tune_count,
+            "trades_since_tune": self.trades_since_tune,
+            "next_tune_in":      max(0, ORB_TUNE_EVERY - self.trades_since_tune),
+            "total_records":     len(self.records),
+            "recent_wr":         round(wins / len(recent) * 100, 1) if recent else None,
+            "tp_multiplier":     self.tp_multiplier,
+            "min_or_size":       self.min_or_size,
+            "max_or_size":       self.max_or_size,
+            "breakout_confirm":  self.breakout_confirm,
+            "direction_bias":    self.direction_bias or "BOTH",
+            "trade_window_end":  f"{self.trade_window_end[0]}:{self.trade_window_end[1]:02d} ET",
+        }
+
+orb_tuner = ORBTuner()
 
 # ── DAILY STATS ───────────────────────────────────────────────────────────────
 class DayStats:
@@ -414,7 +585,7 @@ async def process_price(price: float, now: datetime):
     if not allowed:
         return
 
-    direction = orb.check_breakout(price)
+    direction = orb.check_breakout(price, tuner_bias=orb_tuner.direction_bias)
     if not direction:
         return
 
@@ -560,6 +731,7 @@ async def health():
         "reason":   reason,
         "price_es": price_es,
         "orb":      orb.status(),
+        "tuner":    orb_tuner.status(),
         **stats.status(),
     }
 
@@ -589,27 +761,65 @@ async def set_prior_close(req: Request):
     return {"ok": True, "prior_close": close}
 
 class ResultPayload(BaseModel):
-    pnl:  float
-    won:  bool
-    note: Optional[str] = None
+    pnl:             float
+    won:             bool
+    direction:       Optional[str]   = None   # BUY or SELL
+    or_size:         Optional[float] = None   # OR size in pts
+    entry_time_mins: Optional[int]   = None   # mins since midnight ET
+    note:            Optional[str]   = None
 
 @app.post("/result")
 async def record_result(p: ResultPayload):
     locked = stats.record(p.pnl)
     s = stats.status()
+
+    # Feed tuner
+    now_et     = datetime.now(EST)
+    entry_mins = p.entry_time_mins or (now_et.hour * 60 + now_et.minute)
+    rec = ORBTradeRecord(
+        direction       = p.direction or "BUY",
+        or_size         = p.or_size or (orb.or_size or 10.0),
+        entry_time_mins = entry_mins,
+        pnl             = p.pnl,
+        won             = p.won,
+        bias            = orb.bias,
+    )
+    orb_tuner.record(rec)
+
+    # Auto-tune every ORB_TUNE_EVERY trades
+    if orb_tuner.trades_since_tune >= ORB_TUNE_EVERY:
+        changes = orb_tuner.tune()
+        ts = orb_tuner.status()
+        if changes:
+            change_text = "\n".join(f"  {c}" for c in changes)
+            await send_telegram(
+                f"🧠 *ORB Auto-Tune* — Cycle #{orb_tuner.tune_count}\n"
+                f"After {orb_tuner.total_records} trades ({ts['recent_wr']}% WR):\n\n"
+                f"{change_text}"
+            )
+        else:
+            await send_telegram(
+                f"🧠 *ORB Auto-Tune #{orb_tuner.tune_count}* — No changes needed\n"
+                f"WR: {ts['recent_wr']}% ✅"
+            )
+
     await broadcast({"type": "result", "pnl": p.pnl, "stats": s})
     if locked:
         await send_telegram(
             f"⛔ *ORB BOT LOCKED — Drawdown Hit*\n"
             f"Total P&L: `${stats.total_pnl:.0f}` | Floor: `${stats.trailing_floor:.0f}`"
         )
-    return s
+    return {**s, "tuner": orb_tuner.status()}
 
 @app.get("/stats")
 async def get_stats():
     allowed, reason = stats.can_trade(datetime.now(EST))
     return {**stats.status(), "trading_allowed": allowed, "reason": reason,
             "orb": orb.status()}
+
+@app.get("/tuner")
+async def get_tuner():
+    return orb_tuner.status()
 
 @app.post("/reset-day")
 async def reset_day():
