@@ -235,7 +235,7 @@ class DayStats:
             self.day_date       = today
 
     @property
-    def trailing_floor(self): return self.eod_peak_pnl - EOD_TRAIL_MAX
+    def trailing_floor(self): return self.eod_peak_pnl - abs(MAX_EOD_LOSS)
 
     @property
     def win_rate(self):
