@@ -70,7 +70,7 @@ NEWS_BLOCK_MINS = 30  # block trades within this many mins of Tier 1
 # Trade sizing — ES micro contracts
 # ES point value = $50/pt, MES = $5/pt
 # Using MES so sizing matches All Night Bot
-CONTRACTS    = 2    # 2 MES contracts per signal (conservative start)
+CONTRACTS    = 5    # 5 MES contracts per signal
 POINT_VALUE  = 5.0  # MES
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
@@ -502,6 +502,9 @@ async def send_telegram(text: str):
 
 # ── PMT WEBHOOK ───────────────────────────────────────────────────────────────
 async def fire_pmt(direction: str, dollar_tp: float, dollar_sl: float) -> tuple[bool, str]:
+    # PMT Total Profit/Loss mode uses per-contract dollar amounts
+    per_contract_tp = round(dollar_tp / CONTRACTS, 2)
+    per_contract_sl = round(dollar_sl / CONTRACTS, 2)
     payload = {
         "symbol":                "MES1!",
         "strategy_name":         f"AlphaGrid_ORB_{direction}",
@@ -511,8 +514,8 @@ async def fire_pmt(direction: str, dollar_tp: float, dollar_sl: float) -> tuple[
         "risk_percentage":       0,
         "price":                 str(price_es),
         "tp":                    0, "percentage_tp": 0,
-        "dollar_tp":             dollar_tp,
-        "sl":                    0, "dollar_sl": dollar_sl,
+        "dollar_tp":             per_contract_tp,
+        "sl":                    0, "dollar_sl": per_contract_sl,
         "percentage_sl":         0,
         "trail":                 0, "trail_stop": 0,
         "trail_trigger":         0, "trail_freq": 0,
