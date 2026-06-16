@@ -502,9 +502,14 @@ async def send_telegram(text: str):
 
 # ── PMT WEBHOOK ───────────────────────────────────────────────────────────────
 async def fire_pmt(direction: str, dollar_tp: float, dollar_sl: float) -> tuple[bool, str]:
-    # PMT Total Profit/Loss mode uses per-contract dollar amounts
-    per_contract_tp = round(dollar_tp / CONTRACTS, 2)
-    per_contract_sl = round(dollar_sl / CONTRACTS, 2)
+    sl_pts = dollar_sl / CONTRACTS / POINT_VALUE
+    tp_pts = dollar_tp / CONTRACTS / POINT_VALUE
+    if direction.lower() == "buy":
+        sl_price_calc = round(price_es - sl_pts, 2)
+        tp_price_calc = round(price_es + tp_pts, 2)
+    else:
+        sl_price_calc = round(price_es + sl_pts, 2)
+        tp_price_calc = round(price_es - tp_pts, 2)
     payload = {
         "symbol":                "MES1!",
         "strategy_name":         f"AlphaGrid_ORB_{direction}",
@@ -513,9 +518,9 @@ async def fire_pmt(direction: str, dollar_tp: float, dollar_sl: float) -> tuple[
         "quantity":              str(CONTRACTS),
         "risk_percentage":       0,
         "price":                 str(price_es),
-        "tp":                    0, "percentage_tp": 0,
+        "tp":                    tp_price_calc, "percentage_tp": 0,
         "dollar_tp":             0,
-        "sl":                    0, "dollar_sl": 0,
+        "sl":                    sl_price_calc, "dollar_sl": 0,
         "percentage_sl":         0,
         "trail":                 0, "trail_stop": 0,
         "trail_trigger":         0, "trail_freq": 0,
