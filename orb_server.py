@@ -42,7 +42,7 @@ ORB_W2_END       = time(10, 30)
 
 OR_GAP_MAX_PTS   = 20.0
 OR_TP_MULTIPLIER = 1.5
-MAX_OR_SIZE_PTS  = 30.0
+MAX_OR_SIZE_PTS  = 20.0
 MIN_OR_SIZE_PTS  = 3.0
 BREAKOUT_CONFIRM = 0.5        # pts beyond OR edge to confirm W1 breakout
 RETEST_TOLERANCE = 0.75       # pts — how close price must get to retest level to trigger W2
