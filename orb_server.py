@@ -849,16 +849,31 @@ async def report_eod_now():
 @app.post("/test-trade")
 async def test_trade():
     """Fire a test ORB trade to verify PMT → Tradovate pipeline."""
-    test_price = price_es if price_es > 0 else 7555.0
-    # Simulate a 10pt OR for test
-    test_or_size = 10.0
-    test_tp = test_or_size * OR_TP_MULTIPLIER * CONTRACTS * POINT_VALUE   # $150
-    test_sl = test_or_size * CONTRACTS * POINT_VALUE                       # $100
+    global price_es
+    test_price = price_es if price_es > 0 else 7616.0
+    price_es = test_price  # ensure price is set for SL calc
+
+    # Use tight test SL/TP — 6.7pts SL, 13.3pts TP (same as All Night Bot L1)
+    sl_pts = 6.75
+    tp_pts = 13.25
+    test_sl = sl_pts * CONTRACTS * POINT_VALUE   # $168.75 total
+    test_tp = tp_pts * CONTRACTS * POINT_VALUE   # $331.25 total
+
+    sl_price = round(test_price - sl_pts, 2)
+    tp_price = round(test_price + tp_pts, 2)
+
     ok, body = await fire_pmt("buy", test_tp, test_sl)
     status = "✅" if ok else "❌"
-    msg = f"🧪 *ORB Test Trade*\nMES BUY @ `{test_price:.2f}`\n{status} PMT: `{body[:100]}`\nTP: `+${test_tp:.0f}` | SL: `-${test_sl:.0f}`"
+    msg = (
+        f"🧪 *ORB Test Trade*\n"
+        f"MES BUY @ `{test_price:.2f}`\n"
+        f"{status} PMT: `{body[:100]}`\n"
+        f"TP: `{tp_price:.2f}` (+{tp_pts}pts) | SL: `{sl_price:.2f}` (-{sl_pts}pts)"
+    )
     await send_telegram(msg)
-    return {"ok": ok, "body": body[:200], "price": test_price}
+    return {"ok": ok, "body": body[:200], "price": test_price,
+            "sl_price": sl_price, "tp_price": tp_price,
+            "sl_pts": sl_pts, "tp_pts": tp_pts}
 
 @app.websocket("/ws")
 async def ws_ep(ws: WebSocket):
