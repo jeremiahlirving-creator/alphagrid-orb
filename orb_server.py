@@ -32,7 +32,7 @@ EST = ZoneInfo("America/New_York")
 
 ORB_BUILD_START  = time(8,  0)    # ET — start building opening range
 ORB_BUILD_END    = time(8, 15)    # ET — opening range locked
-ORB_TRADE_END    = time(9, 30)    # ET — no new entries after this
+ORB_TRADE_END    = time(10, 0)    # ET — no new entries after this
 OR_GAP_MAX_PTS   = 20.0           # skip day if gap > 20pts
 OR_TP_MULTIPLIER = 1.5            # TP = 1.5 × OR size
 MAX_OR_SIZE_PTS  = 30.0           # skip if OR too wide (choppy open)
@@ -246,7 +246,7 @@ class ORBTuner:
         self.max_or_size       = MAX_OR_SIZE_PTS     # 30.0pts
         self.breakout_confirm  = BREAKOUT_CONFIRM    # 0.5pts
         self.direction_bias    = None                # None = both, "BUY", "SELL"
-        self.trade_window_end  = (9, 30)             # (hour, minute) ET
+        self.trade_window_end  = (10, 0)             # (hour, minute) ET
 
     def record(self, rec: ORBTradeRecord):
         self.records.append(rec)
@@ -330,7 +330,7 @@ class ORBTuner:
 
         # ── 4. TRADE WINDOW ───────────────────────────────────────────────────
         early  = [r for r in recent if r.entry_time_mins < 8*60+30]   # before 8:30
-        late   = [r for r in recent if r.entry_time_mins >= 9*60]     # after 9:00
+        late   = [r for r in recent if r.entry_time_mins >= 9*60+30]  # after 9:30
         if len(late) >= 4:
             late_wr = self._wr(late)
             if late_wr is not None and late_wr < 0.35:
@@ -713,7 +713,7 @@ async def scheduler():
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(scheduler())
     logger.info("AlphaGrid ORB Bot — autonomous 🏛️")
-    logger.info(f"OR window: 8:00–8:15 ET | Trade window: 8:15–9:30 ET")
+    logger.info(f"OR window: 8:00–8:15 ET | Trade window: 8:15–10:00 ET")
     logger.info(f"Filters: gap<{OR_GAP_MAX_PTS}pts | OR {MIN_OR_SIZE_PTS}–{MAX_OR_SIZE_PTS}pts | bias-aligned | 1 trade/day")
     yield
     task.cancel()
