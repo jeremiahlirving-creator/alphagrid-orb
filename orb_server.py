@@ -39,7 +39,6 @@ EST = ZoneInfo("America/New_York")
 #   7. SL: opposite side of opening range
 #   8. TP: 1.5× the opening range size
 #   9. News filter: no trades within 30 mins of major release
-#  10. Gap filter: skip if ES gaps more than 20pts at open
 #  11. OR size filter: skip if OR < 3pts or > 30pts
 
 ORB_BUILD_START  = time(8,  0)
@@ -49,7 +48,6 @@ ORB_W1_END       = time(9, 30)
 ORB_W2_START     = time(9, 30)
 ORB_W2_END       = time(10, 30)
 
-OR_GAP_MAX_PTS   = 20.0
 OR_TP_MULTIPLIER = 1.5
 MAX_OR_SIZE_PTS  = 20.0
 MIN_OR_SIZE_PTS  = 3.0
@@ -111,8 +109,6 @@ class ORBState:
         self.prior_close    = None
         self.bias           = None
         # Filters
-        self.gap_pts        = None
-        self.gap_skip       = False
         self.or_skip        = False
         # Breakout triggers (W1)
         self.breakout_high  = None
@@ -155,11 +151,6 @@ class ORBState:
             if self.or_high is None:
                 self.or_high = price
                 self.or_low  = price
-                if self.prior_close:
-                    self.gap_pts = abs(price - self.prior_close)
-                    if self.gap_pts > OR_GAP_MAX_PTS:
-                        self.gap_skip = True
-                        logger.warning(f"⚠️ Gap skip — {self.gap_pts:.1f}pts")
             else:
                 self.or_high = max(self.or_high, price)
                 self.or_low  = min(self.or_low,  price)
@@ -217,7 +208,7 @@ class ORBState:
 
     # ── W1: early breakout ────────────────────────────────────────────────────
     def check_breakout_w1(self, price: float, tuner_bias: str = None) -> Optional[str]:
-        if not self.or_locked or self.or_skip or self.gap_skip or self.w1_traded:
+        if not self.or_locked or self.or_skip or self.w1_traded:
             return None
         active_bias = tuner_bias if tuner_bias and tuner_bias != "BOTH" else self.bias
         if price >= self.breakout_high and (active_bias in ("BUY", None)):
@@ -230,12 +221,13 @@ class ORBState:
     def check_retest_w2(self, price: float, tuner_bias: str = None) -> tuple[Optional[str], Optional[str]]:
         """
         Returns (direction, level_label) or (None, None).
-        Fires when price comes back within RETEST_TOLERANCE of:
-          - OR High  → BUY retest (support)
-          - OR Low   → SELL retest (resistance)
-          - OB Mid   → bias-direction retest
+        W2 break & retest logic:
+          - OR High retest (BUY): price previously broke ABOVE OR High, now retests from above
+          - OR Low retest (SELL): price previously broke BELOW OR Low, now retests from below
+          - OB Mid: retest in bias direction
+        Only fires if price has already extended BEYOND the level first.
         """
-        if not self.or_locked or self.or_skip or self.gap_skip or self.w2_traded:
+        if not self.or_locked or self.or_skip or self.w2_traded:
             return None, None
         active_bias = tuner_bias if tuner_bias and tuner_bias != "BOTH" else self.bias
 
@@ -246,21 +238,23 @@ class ORBState:
             if dist > RETEST_TOLERANCE:
                 continue
 
-            # OR High acts as support on retest → BUY
+            # OR High retest → BUY (price broke above OR High, now pulling back to it)
+            # Price must be approaching from ABOVE (just broken level retest)
             if label == "OR High":
-                if price <= level and (active_bias in ("BUY", None)):
+                if price <= level and price >= level - RETEST_TOLERANCE and (active_bias in ("BUY", None)):
                     return "BUY", label
 
-            # OR Low acts as resistance on retest → SELL
+            # OR Low retest → SELL (price broke below OR Low, now bouncing back to it)
+            # Price must be approaching from BELOW (just broken level retest)
             elif label == "OR Low":
-                if price >= level and (active_bias in ("SELL", None)):
+                if price >= level and price <= level + RETEST_TOLERANCE and (active_bias in ("SELL", None)):
                     return "SELL", label
 
             # OB Mid → trade in bias direction
             elif label == "OB Mid":
-                if active_bias == "BUY" and price <= level:
+                if active_bias == "BUY" and price <= level and price >= level - RETEST_TOLERANCE:
                     return "BUY", label
-                if active_bias == "SELL" and price >= level:
+                if active_bias == "SELL" and price >= level and price <= level + RETEST_TOLERANCE:
                     return "SELL", label
 
         return None, None
@@ -300,8 +294,6 @@ class ORBState:
             "ob_mid":        self.ob_mid,
             "retest_levels": self.retest_levels,
             "or_skip":       self.or_skip,
-            "gap_skip":      self.gap_skip,
-            "gap_pts":       round(self.gap_pts, 2) if self.gap_pts else None,
             "bias":          self.bias,
             "prior_close":   self.prior_close,
             "breakout_high": self.breakout_high,
@@ -512,7 +504,7 @@ class DayStats:
             return False, f"Intraday trailing hit (floor: ${self.trailing_floor_intraday:.0f})"
         if IS_EVAL_MODE and self.total_pnl >= PROFIT_TARGET:
             return False, f"Profit target reached! (${self.total_pnl:.0f})"
-        if IS_EVAL_MODE and self.total_pnl > 0:
+        if IS_EVAL_MODE and self.total_pnl > 0 and self.day_pnl > 0:
             if self.day_pnl >= self.total_pnl * CONSISTENCY_CAP:
                 return False, f"Consistency cap hit (day ${self.day_pnl:.0f} > 50% of ${self.total_pnl:.0f})"
         if now:
@@ -631,7 +623,7 @@ async def process_price(price: float, now: datetime):
         logger.info(f"📏 Building OR: H={orb.or_high:.2f} L={orb.or_low:.2f} @ {now.strftime('%H:%M ET')}")
 
     # OR locked notification at 8:15
-    if h == 8 and m == 15 and orb.or_locked and not orb.gap_skip and not orb.or_skip:
+    if h == 8 and m == 15 and orb.or_locked and not orb.or_skip:
         lvl_lines = "\n".join(f"  `{l['label']}`: `{l['level']:.2f}`" for l in orb.retest_levels)
         await send_telegram(
             f"🎯 *ORB Locked* — {now.strftime('%b %d')}\n"
@@ -643,16 +635,15 @@ async def process_price(price: float, now: datetime):
             f"🪟 *W2 retest levels* (9:30–10:30 ET)\n"
             f"{lvl_lines}"
         )
-    elif h == 8 and m == 15 and orb.or_locked and (orb.gap_skip or orb.or_skip):
-        reason = (f"gap {orb.gap_pts:.1f}pts > {OR_GAP_MAX_PTS}pts" if orb.gap_skip
-                  else f"OR size {orb.or_size:.1f}pts out of {MIN_OR_SIZE_PTS}–{MAX_OR_SIZE_PTS}pt range")
+    elif h == 8 and m == 15 and orb.or_locked and orb.or_skip:
+        reason = f"OR size {orb.or_size:.1f}pts out of {MIN_OR_SIZE_PTS}–{MAX_OR_SIZE_PTS}pt range"
         await send_telegram(
             f"⏭️ *ORB Skipped* — {now.strftime('%b %d')}\n"
             f"Reason: {reason}\nNo trades today."
         )
 
     # W2 open alert at 9:30
-    if h == 9 and m == 30 and orb.or_locked and not orb.gap_skip and not orb.or_skip:
+    if h == 9 and m == 30 and orb.or_locked and not orb.or_skip:
         w1_result = f"W1: {'✅ ' + orb.w1_trade_dir if orb.w1_traded else '⬜ No trade'}"
         lvl_lines = "\n".join(f"  `{l['label']}`: `{l['level']:.2f}`" for l in orb.retest_levels)
         await send_telegram(
@@ -763,8 +754,7 @@ async def report_eod():
     orb_s = orb.status()
     emoji = "🟢" if stats.day_pnl > 0 else "🔴" if stats.day_pnl < 0 else "⚪"
     skip  = ""
-    if orb_s['gap_skip']:  skip = f"Gap skip ({orb_s['gap_pts']}pts)"
-    elif orb_s['or_skip']: skip = f"OR size skip ({orb_s['or_size']}pts)"
+    if orb_s['or_skip']: skip = f"OR size skip ({orb_s['or_size']}pts)"
     w1_str = f"✅ {orb_s['w1_trade_dir']}" if orb_s['w1_traded'] else "⬜ None"
     w2_str = f"✅ {orb_s['w2_trade_dir']} @ {orb_s['w2_level_hit']}" if orb_s['w2_traded'] else "⬜ None"
     await send_telegram(
@@ -776,7 +766,7 @@ async def report_eod():
         f"  Day P&L: `${stats.day_pnl:+.2f}`\n\n"
         f"📏 *OR* H:`{orb_s['or_high']}` L:`{orb_s['or_low']}` Size:`{orb_s['or_size']}pts`\n"
         f"📐 *OB Mid*: `{orb_s['ob_mid']}`\n"
-        f"  Bias: `{orb_s['bias'] or 'N/A'}` | Gap: `{orb_s['gap_pts']}pts`\n\n"
+        f"  Bias: `{orb_s['bias'] or 'N/A'}`\n\n"
         f"💼 *Account*\n"
         f"  Total P&L: `${s['total_pnl']:+.2f}`\n"
         f"  Win Rate: `{s['win_rate']}%` ({s['wins']}W/{s['losses']}L)\n"
@@ -989,7 +979,6 @@ async def ws_ep(ws: WebSocket):
             "w2_levels":         ["OR High", "OR Low", "OB Midpoint"],
             "retest_tolerance":  RETEST_TOLERANCE,
             "tp_multiplier":     OR_TP_MULTIPLIER,
-            "gap_max_pts":       OR_GAP_MAX_PTS,
             "or_size_range":     f"{MIN_OR_SIZE_PTS}–{MAX_OR_SIZE_PTS}pts",
         }
     }))
