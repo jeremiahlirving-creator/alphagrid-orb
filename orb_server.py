@@ -11,6 +11,15 @@ import aiohttp
 
 load_dotenv()
 
+# Upstash Redis for persistent state across Railway restarts
+try:
+    from upstash import redis_set_json, redis_get_json
+    UPSTASH_ENABLED = True
+except ImportError:
+    UPSTASH_ENABLED = False
+    import logging
+    logging.getLogger("orb_bot").warning("⚠️ upstash.py not found — state will not persist across restarts")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger("orb_bot")
 
@@ -797,20 +806,18 @@ async def scheduler():
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Restore prior close from disk on startup
+    # Restore prior close from Upstash Redis on startup
     try:
-        import json as _json
-        with open("/tmp/orb_prior_close.json") as f:
-            data = _json.load(f)
-        saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
-        # Only restore if saved today or yesterday (prior close is always previous day)
-        if (date.today() - saved_date).days <= 1:
-            orb.prior_close = float(data["close"])
-            logger.info(f"📂 Prior close restored: {orb.prior_close:.2f} (saved {saved_date})")
+        data = await redis_get_json("alphagrid:orb:prior_close") if UPSTASH_ENABLED else None
+        if data:
+            saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
+            if (date.today() - saved_date).days <= 1:
+                orb.prior_close = float(data["close"])
+                logger.info(f"📂 Prior close restored from Redis: {orb.prior_close:.2f} (saved {saved_date})")
+            else:
+                logger.info(f"📂 Prior close too old ({saved_date}) — skipping")
         else:
-            logger.info(f"📂 Prior close too old ({saved_date}) — skipping")
-    except FileNotFoundError:
-        logger.info("📂 No saved prior close — waiting for TradingView alert")
+            logger.info("📂 No prior close in Redis — waiting for TradingView alert")
     except Exception as e:
         logger.warning(f"📂 Could not restore prior close: {e}")
 
@@ -866,13 +873,15 @@ async def set_prior_close(req: Request):
         return {"ok": False}
     orb.prior_close = close
     logger.info(f"📌 Prior close set: {close:.2f}")
-    # Persist to disk so it survives Railway restarts
+    # Persist to Upstash Redis — survives Railway restarts
     try:
-        import json as _json
-        with open("/tmp/orb_prior_close.json", "w") as f:
-            _json.dump({"close": close, "date": date.today().isoformat()}, f)
+        if UPSTASH_ENABLED:
+            await redis_set_json("alphagrid:orb:prior_close", {
+            "close": close,
+            "date":  date.today().isoformat(),
+            })
     except Exception as e:
-        logger.warning(f"Could not save prior close: {e}")
+        logger.warning(f"Could not save prior close to Redis: {e}")
     return {"ok": True, "prior_close": close}
 
 class ResultPayload(BaseModel):
