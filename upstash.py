@@ -1,56 +1,54 @@
 """
-Upstash Redis REST client — zero dependencies, pure aiohttp.
-Used by AlphaGrid bots to persist state across Railway redeploys.
+Upstash Redis REST client — uses POST body for reliable JSON storage.
 """
 import os, aiohttp, json as _json
 
-UPSTASH_URL   = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_URL   = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-async def redis_set(key: str, value: str) -> bool:
-    """SET key value in Upstash Redis."""
+def _headers():
+    return {
+        "Authorization": f"Bearer {UPSTASH_TOKEN}",
+        "Content-Type":  "application/json",
+    }
+
+async def redis_set_json(key: str, value: dict) -> bool:
+    """Store a dict as JSON string using SET command via POST body."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return False
     try:
+        serialized = _json.dumps(value)
         async with aiohttp.ClientSession() as s:
             async with s.post(
-                f"{UPSTASH_URL}/set/{key}/{value}",
-                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-                timeout=aiohttp.ClientTimeout(total=3),
+                UPSTASH_URL,
+                headers=_headers(),
+                json=["SET", key, serialized],
+                timeout=aiohttp.ClientTimeout(total=5),
             ) as r:
-                return r.status == 200
-    except Exception:
+                data = await r.json()
+                return data.get("result") == "OK"
+    except Exception as e:
+        import logging
+        logging.getLogger("upstash").warning(f"redis_set_json error: {e}")
         return False
 
-async def redis_get(key: str) -> str | None:
-    """GET key from Upstash Redis. Returns None if missing."""
+async def redis_get_json(key: str) -> dict | None:
+    """Retrieve a JSON dict using GET command via POST body."""
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return None
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"{UPSTASH_URL}/get/{key}",
-                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-                timeout=aiohttp.ClientTimeout(total=3),
+            async with s.post(
+                UPSTASH_URL,
+                headers=_headers(),
+                json=["GET", key],
+                timeout=aiohttp.ClientTimeout(total=5),
             ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return data.get("result")
-    except Exception:
-        pass
-    return None
-
-async def redis_set_json(key: str, value: dict) -> bool:
-    """Store a dict as JSON string."""
-    encoded = _json.dumps(value).replace("/", "%2F")
-    return await redis_set(key, encoded)
-
-async def redis_get_json(key: str) -> dict | None:
-    """Retrieve a JSON dict."""
-    raw = await redis_get(key)
-    if raw:
-        try:
-            return _json.loads(raw)
-        except Exception:
-            pass
+                data = await r.json()
+                raw = data.get("result")
+                if raw:
+                    return _json.loads(raw)
+    except Exception as e:
+        import logging
+        logging.getLogger("upstash").warning(f"redis_get_json error: {e}")
     return None
