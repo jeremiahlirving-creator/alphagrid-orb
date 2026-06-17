@@ -797,6 +797,23 @@ async def scheduler():
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Restore prior close from disk on startup
+    try:
+        import json as _json
+        with open("/tmp/orb_prior_close.json") as f:
+            data = _json.load(f)
+        saved_date = date.fromisoformat(data.get("date", "2000-01-01"))
+        # Only restore if saved today or yesterday (prior close is always previous day)
+        if (date.today() - saved_date).days <= 1:
+            orb.prior_close = float(data["close"])
+            logger.info(f"📂 Prior close restored: {orb.prior_close:.2f} (saved {saved_date})")
+        else:
+            logger.info(f"📂 Prior close too old ({saved_date}) — skipping")
+    except FileNotFoundError:
+        logger.info("📂 No saved prior close — waiting for TradingView alert")
+    except Exception as e:
+        logger.warning(f"📂 Could not restore prior close: {e}")
+
     task = asyncio.create_task(scheduler())
     logger.info("AlphaGrid ORB Bot — autonomous 🏛️")
     logger.info("OR: 8:00–8:15 ET | W1: 8:15–9:30 ET | W2: 9:30–10:30 ET (break & retest)")
@@ -849,6 +866,13 @@ async def set_prior_close(req: Request):
         return {"ok": False}
     orb.prior_close = close
     logger.info(f"📌 Prior close set: {close:.2f}")
+    # Persist to disk so it survives Railway restarts
+    try:
+        import json as _json
+        with open("/tmp/orb_prior_close.json", "w") as f:
+            _json.dump({"close": close, "date": date.today().isoformat()}, f)
+    except Exception as e:
+        logger.warning(f"Could not save prior close: {e}")
     return {"ok": True, "prior_close": close}
 
 class ResultPayload(BaseModel):
