@@ -166,12 +166,14 @@ class ORBState:
                 self.ob_mid = round((self.ob_open + self.ob_close) / 2, 2)
                 logger.info(f"📐 OB: open={self.ob_open:.2f} close={self.ob_close:.2f} mid={self.ob_mid:.2f}")
 
-            if self.or_size > MAX_OR_SIZE_PTS:
+            active_min = orb_tuner.min_or_size
+            active_max = orb_tuner.max_or_size
+            if self.or_size > active_max:
                 self.or_skip = True
-                logger.warning(f"⚠️ OR skip — too wide: {self.or_size:.1f}pts")
-            elif self.or_size < MIN_OR_SIZE_PTS:
+                logger.warning(f"⚠️ OR skip — too wide: {self.or_size:.1f}pts (max={active_max}pts)")
+            elif self.or_size < active_min:
                 self.or_skip = True
-                logger.warning(f"⚠️ OR skip — too tight: {self.or_size:.1f}pts")
+                logger.warning(f"⚠️ OR skip — too tight: {self.or_size:.1f}pts (min={active_min}pts)")
             else:
                 self.breakout_high = self.or_high + BREAKOUT_CONFIRM
                 self.breakout_low  = self.or_low  - BREAKOUT_CONFIRM
@@ -397,6 +399,28 @@ class ORBTuner:
             self.retest_tolerance = max(old - 0.10, 0.25)
             if abs(self.retest_tolerance - old) > 0.05:
                 changes.append(f"📍 Retest tolerance {old:.2f}→{self.retest_tolerance:.2f}pts")
+
+        # OR size filter tuning — find the OR size sweet spot
+        # Analyze which OR sizes produced wins vs losses
+        sized = [(r.or_size, r.won) for r in recent if r.or_size]
+        if len(sized) >= 8:
+            win_sizes  = [s for s, w in sized if w]
+            loss_sizes = [s for s, w in sized if not w]
+            if win_sizes and loss_sizes:
+                avg_win_or  = sum(win_sizes)  / len(win_sizes)
+                avg_loss_or = sum(loss_sizes) / len(loss_sizes)
+                # Tighten min OR if small ranges are losing
+                if avg_loss_or < avg_win_or and avg_loss_or < self.min_or_size + 2:
+                    old_min = self.min_or_size
+                    self.min_or_size = round(min(avg_win_or * 0.7, self.min_or_size + 1.0), 1)
+                    if abs(self.min_or_size - old_min) >= 0.5:
+                        changes.append(f"📏 Min OR size {old_min:.1f}→{self.min_or_size:.1f}pts (losing on small ORs)")
+                # Tighten max OR if large ranges are losing
+                if avg_loss_or > avg_win_or and avg_loss_or > self.max_or_size - 5:
+                    old_max = self.max_or_size
+                    self.max_or_size = round(max(avg_win_or * 1.3, self.max_or_size - 2.0), 1)
+                    if abs(self.max_or_size - old_max) >= 0.5:
+                        changes.append(f"📏 Max OR size {old_max:.1f}→{self.max_or_size:.1f}pts (losing on large ORs)")
 
         return changes
 
@@ -765,6 +789,8 @@ async def scheduler():
             sent_eod = False
             last_date = today
         h, m = now.hour, now.minute
+        if now.weekday() >= 5:   # skip weekends
+            continue
         if h == 7  and m == 55 and not sent_755: sent_755 = True; await report_premarket()
         if h == 16 and m == 30 and not sent_eod: sent_eod = True; await report_eod()
 
@@ -880,6 +906,7 @@ async def get_tuner():
     return orb_tuner.status()
 
 @app.post("/reset-day")
+@app.get("/reset-day")
 async def reset_day():
     stats.day_pnl  = 0.0
     stats.day_date = date.today()
